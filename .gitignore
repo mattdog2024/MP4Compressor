@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+Python-3.11.14/
+
+# Distribution / freezing
+build/
+dist/
+*.spec
+
+# FFmpeg binaries (optional, but recommended to valid large file issues)
+ffmpeg/
+*.zip
+*.exe
+*.7z
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
