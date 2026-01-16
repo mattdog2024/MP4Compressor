@@ -8,6 +8,8 @@ import sys
 import shutil
 import re
 import time
+import uuid
+import tempfile
 
 # 设置外观模式 - 亮色
 ctk.set_appearance_mode("Light")
@@ -63,6 +65,7 @@ class App(ctk.CTk):
 
         # 变量
         self.file_list = []
+        self.file_subtitles = {}  # {video_path: subtitle_path}
         self.is_processing = False
         self.stop_event = threading.Event()
         self.current_process = None
@@ -143,6 +146,9 @@ class App(ctk.CTk):
         self.btn_add = ctk.CTkButton(self.btn_frame, text="+ 添加视频", command=self.add_files, width=120, height=35, font=("SimHei", 13))
         self.btn_add.pack(side="left", padx=(0, 10))
         
+        self.btn_set_sub = ctk.CTkButton(self.btn_frame, text="设置字幕", command=self.set_subtitle, width=100, height=35, font=("SimHei", 13), fg_color="#E67E22", hover_color="#D35400")
+        self.btn_set_sub.pack(side="left", padx=(0, 10))
+
         self.btn_clear = ctk.CTkButton(self.btn_frame, text="清空", command=self.clear_files, width=80, height=35, fg_color="transparent", border_width=1, text_color="gray", font=("SimHei", 13))
         self.btn_clear.pack(side="left")
 
@@ -316,14 +322,49 @@ class App(ctk.CTk):
             for f in files:
                 if f not in self.file_list:
                     self.file_list.append(f)
-                    self.file_listbox.insert(tk.END, f)
+            self.refresh_file_list()
             self.log_msg(f"添加了 {len(files)} 个文件")
             self.status_label.configure(text=f"已添加 {len(files)} 个文件")
 
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        for f in self.file_list:
+            display_text = f
+            if f in self.file_subtitles:
+                sub_name = os.path.basename(self.file_subtitles[f])
+                display_text += f"   [字幕: {sub_name}]"
+            self.file_listbox.insert(tk.END, display_text)
+
     def clear_files(self):
         self.file_list = []
+        self.file_subtitles = {}
         self.file_listbox.delete(0, tk.END)
         self.status_label.configure(text="列表已清空")
+
+    def set_subtitle(self):
+        selection = self.file_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("提示", "请先在列表中选择一个视频文件")
+            return
+        
+        index = selection[0]
+        video_path = self.file_list[index]
+        
+        # 简单的 MKV 检查 (可选，目前允许所有格式尝试加载字幕)
+        # ext = os.path.splitext(video_path)[1].lower()
+        # if ext != '.mkv':
+        #     if not messagebox.askyesno("提示", "该功能主要是为 MKV 设计的，确认要为非 MKV 文件添加字幕吗？"):
+        #         return
+
+        sub_file = filedialog.askopenfilename(
+            title="选择字幕文件",
+            filetypes=[("字幕文件", "*.srt *.ass *.ssa"), ("所有文件", "*.*")]
+        )
+        
+        if sub_file:
+            self.file_subtitles[video_path] = sub_file
+            self.refresh_file_list()
+            self.log_msg(f"为 {os.path.basename(video_path)} 设置了字幕: {os.path.basename(sub_file)}")
 
     def start_processing_thread(self):
         if not self.file_list:
@@ -335,6 +376,7 @@ class App(ctk.CTk):
         self.btn_start.configure(state="disabled")
         self.btn_add.configure(state="disabled")
         self.btn_clear.configure(state="disabled")
+        self.btn_set_sub.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.open_log_window() 
         
@@ -408,10 +450,40 @@ class App(ctk.CTk):
 
         vol_factor = self.slider_vol.get()
         
+        # 视频滤镜链
+        vf_chain = "scale=800:450"
+        
+        temp_sub_path = None
+
+        # 检查是否有字幕
+        if input_path in self.file_subtitles:
+            original_sub = self.file_subtitles[input_path]
+            try:
+                # 创建临时字幕文件以避免特殊字符 (空格, 括号, 引号等) 导致的 FFmpeg 路径错误
+                ext = os.path.splitext(original_sub)[1]
+                temp_filename = f"safe_sub_{uuid.uuid4().hex}{ext}"
+                temp_dir = tempfile.gettempdir()
+                temp_sub_path = os.path.join(temp_dir, temp_filename)
+                
+                shutil.copy2(original_sub, temp_sub_path)
+                self.log_msg(f"创建临时字幕文件: {temp_sub_path}")
+                
+                # FFmpeg filter 路径转义: 
+                # 1. backslash -> forward slash
+                # 2. escape colon (:) which is a filter delimiter, with \:
+                safe_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:')
+                
+                # 使用 force_style 设置字体
+                vf_chain += f",subtitles='{safe_sub_path}':force_style='FontName=SimHei'"
+                self.log_msg(f"检测到外挂字幕，已处理并在压缩中烧录。")
+            except Exception as e:
+                self.log_msg(f"处理字幕文件失败: {e}")
+                temp_sub_path = None # 防止后续清理出错
+
         cmd = [
             ffmpeg, "-y",
             "-i", input_path,
-            "-vf", "scale=800:450",
+            "-vf", vf_chain,
             "-c:v", self.encoder_name,
             "-b:v", "800k",
             "-maxrate", "1200k",
@@ -428,6 +500,8 @@ class App(ctk.CTk):
             cmd.extend(["-preset", "medium"])
             
         self.log_msg(f"执行命令: {' '.join(cmd)}")
+        
+        start_time = time.time()
         
         try:
             self.current_process = subprocess.Popen(
@@ -458,7 +532,19 @@ class App(ctk.CTk):
                         h, m, s = map(float, t_match.groups())
                         current_time = h*3600 + m*60 + s
                         percent = min(current_time / duration, 1.0)
-                        self.update_ui_text(f"⏳ 处理中 {int(percent*100)}% - {os.path.basename(input_path)}", percent)
+                        
+                        elapsed = time.time() - start_time
+                        if percent > 0.001: # Avoid division by zero or super huge estimates
+                            eta = (elapsed / percent) - elapsed
+                        else:
+                            eta = 0
+                            
+                        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed))
+                        eta_str = time.strftime('%H:%M:%S', time.gmtime(eta))
+                        
+                        fname_base = os.path.basename(input_path)
+                        status_text = f"⏳ {int(percent*100)}% | 已用: {elapsed_str} | 剩余: {eta_str} | {fname_base}"
+                        self.update_ui_text(status_text, percent)
                 
             self.current_process.wait()
             ret_code = self.current_process.returncode
@@ -472,6 +558,13 @@ class App(ctk.CTk):
             return False
         finally:
             self.current_process = None
+            # 清理临时字幕文件
+            if temp_sub_path and os.path.exists(temp_sub_path):
+                try:
+                    os.remove(temp_sub_path)
+                    self.log_msg("已清理临时字幕文件")
+                except Exception as e:
+                    self.log_msg(f"清理临时文件失败 (不影响结果): {e}")
 
     def update_ui_text(self, text, progress):
         self.after(0, lambda: self._update_ui_progress(progress, text))
@@ -484,6 +577,7 @@ class App(ctk.CTk):
         self.btn_start.configure(state="normal")
         self.btn_add.configure(state="normal")
         self.btn_clear.configure(state="normal")
+        self.btn_set_sub.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         
         if self.stop_event.is_set():
