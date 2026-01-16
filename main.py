@@ -116,6 +116,29 @@ class App(ctk.CTk):
         self.btn_browse = ctk.CTkButton(self.settings_frame, text="选择...", width=80, command=self.select_output_folder, font=("SimHei", 14, "bold"), fg_color="#1f538d", text_color="white")
         self.btn_browse.grid(row=1, column=2, padx=15, pady=(5, 15))
 
+        # 2.3 高级选项 (跳过片头/片尾 + 去黑边)
+        self.frame_advanced = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
+        self.frame_advanced.grid(row=2, column=0, columnspan=3, padx=15, pady=(5, 15), sticky="ew")
+        
+        # 跳过片头
+        self.label_skip_start = ctk.CTkLabel(self.frame_advanced, text="跳过片头(秒):", font=("SimHei", 13))
+        self.label_skip_start.pack(side="left", padx=(0, 5))
+        self.entry_skip_start = ctk.CTkEntry(self.frame_advanced, width=60, font=("SimHei", 12))
+        self.entry_skip_start.pack(side="left", padx=(0, 15))
+        self.entry_skip_start.insert(0, "0")
+
+        # 跳过片尾
+        self.label_skip_end = ctk.CTkLabel(self.frame_advanced, text="跳过片尾(秒):", font=("SimHei", 13))
+        self.label_skip_end.pack(side="left", padx=(0, 5))
+        self.entry_skip_end = ctk.CTkEntry(self.frame_advanced, width=60, font=("SimHei", 12))
+        self.entry_skip_end.pack(side="left", padx=(0, 15))
+        self.entry_skip_end.insert(0, "0")
+
+        # 去黑边
+        self.var_crop = ctk.BooleanVar(value=False)
+        self.check_crop = ctk.CTkCheckBox(self.frame_advanced, text="去除黑边 (自动裁剪)", variable=self.var_crop, font=("SimHei", 13))
+        self.check_crop.pack(side="left", padx=(0, 5))
+
         # 3. 文件列表区域
         self.list_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.list_frame.grid(row=2, column=0, padx=20, pady=5, sticky="nsew")
@@ -420,6 +443,51 @@ class App(ctk.CTk):
         self.is_processing = False
         self.after(0, lambda: self.reset_ui(success_count, total))
 
+    def detect_crop(self, ffmpeg, input_path, start_time=0):
+        """
+        使用 cropdetect 滤镜检测视频的有效区域。
+        仅检测几帧以加快速度。
+        """
+        try:
+            # 跳过片头后再检测，避免片头黑屏影响结果
+            ss_arg = str(start_time + 10) # 往后推一点，确保有画面
+            
+            # 如果视频很短，可能 10秒后都没了，那就在 1/3 处检测
+            # 这里简单处理，如果出错或没检测到，就返回 None
+            
+            cmd = [
+                ffmpeg, "-hide_banner",
+                "-ss", ss_arg,
+                "-i", input_path,
+                "-vf", "cropdetect=24:16:0", # limit=24, round=16, reset=0
+                "-vframes", "10",
+                "-f", "null", "-"
+            ]
+            
+            res = subprocess.run(
+                cmd, capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
+            ) # 不要 check=True，因为 -ss 可能超出范围导致错误，我们需要手动处理
+            
+            # 解析输出寻找 crop=w:h:x:y
+            # [Parsed_cropdetect_0 @ ...] x1:0 x2:1919 y1:140 y2:939 w:1920 h:800 x:0 y:140 pts:130 t:5.416667 crop=1920:800:0:140
+            matches = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr)
+            if matches:
+                # 统计出现次数最多的 crop 参数（简单的众数）
+                from collections import Counter
+                most_common = Counter(matches).most_common(1)
+                if most_common:
+                    return most_common[0][0]
+            
+            # 备用尝试：如果 offset 10秒 失败（可能视频短），尝试从头开始
+            if start_time == 0: # 避免无限递归
+                return self.detect_crop(ffmpeg, input_path, 0)
+                
+            return None
+        except Exception as e:
+            self.log_msg(f"自动裁剪检测失败: {e}")
+            return None
+
     def run_ffmpeg_task(self, ffmpeg, input_path):
         directory, filename = os.path.split(input_path)
         name, _ = os.path.splitext(filename)
@@ -430,6 +498,19 @@ class App(ctk.CTk):
         else:
             output_path = os.path.join(directory, output_filename)
         
+        # 获取用户设置
+        try:
+            skip_start = float(self.entry_skip_start.get())
+        except:
+            skip_start = 0.0
+            
+        try:
+            skip_end = float(self.entry_skip_end.get())
+        except:
+            skip_end = 0.0
+            
+        do_crop = self.var_crop.get()
+
         duration = 0
         try:
             probe = subprocess.run(
@@ -444,14 +525,40 @@ class App(ctk.CTk):
                 if match:
                     h, m, s = map(float, match.groups())
                     duration = h*3600 + m*60 + s
-                self.log_msg(f"视频时长: {duration} 秒")
+                self.log_msg(f"视频总时长: {duration} 秒")
         except Exception as e:
             self.log_msg(f"Probe Error: {e}")
 
+        # 计算实际编码的时长和起始点
+        if skip_start >= duration:
+            self.log_msg(f"⚠️ 跳过片头 ({skip_start}s) 超过视频时长，跳过此文件。")
+            return False
+            
+        actual_duration = duration - skip_start - skip_end
+        if actual_duration <= 0:
+             self.log_msg(f"⚠️ 设置的裁剪后时长无效 (总:{duration} - 头:{skip_start} - 尾:{skip_end} <= 0)。")
+             return False
+
         vol_factor = self.slider_vol.get()
         
-        # 视频滤镜链
-        vf_chain = "scale=800:450"
+        # 视频滤镜链构建
+        filters = []
+        
+        # 1. 自动裁剪
+        if do_crop:
+            self.log_msg("正在分析黑边区域...")
+            # 尽量在用户希望的开始时间点附近检测，比较准确
+            crop_arg = self.detect_crop(ffmpeg, input_path, start_time=skip_start) 
+            if crop_arg:
+                self.log_msg(f"检测到有效区域: {crop_arg}")
+                filters.append(f"crop={crop_arg}")
+            else:
+                self.log_msg("未检测到明显的黑边，跳过裁剪。")
+
+        # 2. 缩放
+        filters.append("scale=800:450")
+        
+        vf_chain = ",".join(filters)
         
         temp_sub_path = None
 
@@ -481,10 +588,26 @@ class App(ctk.CTk):
                 temp_sub_path = None # 防止后续清理出错
 
         cmd = [
-            ffmpeg, "-y",
-            "-i", input_path,
+            ffmpeg, "-y"
+        ]
+        
+        # 添加跳过片头 (必须放在 -i 之前以利用 input seeking 提高速度，但在某些复杂编码下可能有关键帧对其问题)
+        # 为了精确剪辑，input seeking 结合 output duration 通常较好，或者放在 -i 之后 output seeking (更精确但慢)
+        # 这里为了速度和通用性，我们放在 -i 之前，但注意 FFmpeg 的机制
+        if skip_start > 0:
+            cmd.extend(["-ss", str(skip_start)])
+            
+        cmd.extend(["-i", input_path])
+
+        # 设置处理时长 (注意：如果在 -i 之前用了 -ss，这里的 -t 是指“读取输入流的时长”，即我们需要截取的片段长度)
+        # 如果 skip_end > 0，我们需要截取 duration - skip_start - skip_end
+        if skip_end > 0:
+             cmd.extend(["-t", str(actual_duration)])
+             
+        cmd.extend([
             "-vf", vf_chain,
             "-c:v", self.encoder_name,
+
             "-b:v", "800k",
             "-maxrate", "1200k",
             "-bufsize", "1600k",
@@ -492,7 +615,7 @@ class App(ctk.CTk):
             "-b:a", "128k",
             "-af", f"volume={vol_factor:.2f}",
             output_path
-        ]
+        ])
         
         if "nvenc" in self.encoder_name:
             cmd.extend(["-preset", "p4"])
