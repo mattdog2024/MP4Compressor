@@ -10,6 +10,8 @@ import re
 import time
 import uuid
 import tempfile
+import concurrent.futures
+import math
 
 # 设置外观模式 - 亮色
 ctk.set_appearance_mode("Light")
@@ -73,6 +75,11 @@ class App(ctk.CTk):
         self.encoder_display = "CPU"
         self.log_window = None
         self.output_dir = None
+        self.active_processes = set()
+        self.active_processes_lock = threading.Lock()
+        self.total_files_count = 0
+        self.finished_files_count = 0
+        self.failed_files_count = 0
         
         # 布局配置
         self.grid_columnconfigure(0, weight=1)
@@ -97,7 +104,7 @@ class App(ctk.CTk):
         self.label_vol = ctk.CTkLabel(self.settings_frame, text="音量调整 (0%-200%):", font=ctk.CTkFont(family="SimHei", size=14))
         self.label_vol.grid(row=0, column=0, padx=15, pady=(15, 5))
         
-        self.slider_vol = ctk.CTkSlider(self.settings_frame, from_=0.0, to=2.0, number_of_steps=20)
+        self.slider_vol = ctk.CTkSlider(self.settings_frame, from_=0.0, to=2.0, number_of_steps=200)
         self.slider_vol.set(1.0) 
         self.slider_vol.grid(row=0, column=1, padx=10, pady=(15, 5), sticky="ew")
         
@@ -116,9 +123,21 @@ class App(ctk.CTk):
         self.btn_browse = ctk.CTkButton(self.settings_frame, text="选择...", width=80, command=self.select_output_folder, font=("SimHei", 14, "bold"), fg_color="#1f538d", text_color="white")
         self.btn_browse.grid(row=1, column=2, padx=15, pady=(5, 15))
 
-        # 2.3 高级选项 (跳过片头/片尾 + 去黑边)
+        # 2.3 并行数量
+        self.label_threads = ctk.CTkLabel(self.settings_frame, text="并行任务数:", font=ctk.CTkFont(family="SimHei", size=14))
+        self.label_threads.grid(row=2, column=0, padx=15, pady=(5, 15))
+        
+        self.slider_threads = ctk.CTkSlider(self.settings_frame, from_=1, to=5, number_of_steps=4)
+        self.slider_threads.set(3) # 默认3个，比较科学
+        self.slider_threads.grid(row=2, column=1, padx=10, pady=(5, 15), sticky="ew")
+        
+        self.label_threads_val = ctk.CTkLabel(self.settings_frame, text="3", width=50, font=("SimHei", 12))
+        self.label_threads_val.grid(row=2, column=2, padx=15, pady=(5, 15))
+        self.slider_threads.configure(command=self.update_threads_label)
+
+        # 2.4 高级选项 (跳过片头/片尾 + 去黑边)
         self.frame_advanced = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
-        self.frame_advanced.grid(row=2, column=0, columnspan=3, padx=15, pady=(5, 15), sticky="ew")
+        self.frame_advanced.grid(row=3, column=0, columnspan=3, padx=15, pady=(5, 15), sticky="ew")
         
         # 跳过片头
         self.label_skip_start = ctk.CTkLabel(self.frame_advanced, text="跳过片头(秒):", font=("SimHei", 13))
@@ -218,7 +237,10 @@ class App(ctk.CTk):
     def log_msg(self, msg):
         print(msg) 
         if self.log_window and self.log_window.winfo_exists():
-            self.log_window.log(msg)
+            self.after(0, lambda: self.log_window.log(msg))
+
+    def update_threads_label(self, value):
+        self.label_threads_val.configure(text=f"{int(value)}")
 
     def open_log_window(self):
         if self.log_window is None or not self.log_window.winfo_exists():
@@ -403,45 +425,84 @@ class App(ctk.CTk):
         self.btn_stop.configure(state="normal")
         self.open_log_window() 
         
-        threading.Thread(target=self.process_queue, daemon=True).start()
+        # 收集所有 UI 设置参数 (必须在主线程获取)
+        settings = {
+            "skip_start": self.entry_skip_start.get(),
+            "skip_end": self.entry_skip_end.get(),
+            "crop": self.var_crop.get(),
+            "volume": round(self.slider_vol.get(), 2),
+            "threads": self.slider_threads.get(),
+            "output_dir": self.output_dir
+        }
+
+        threading.Thread(target=self.process_queue, args=(settings,), daemon=True).start()
 
     def stop_processing(self):
         if self.is_processing:
-            self.log_msg("正在停止任务...")
+            self.log_msg("正在停止所有任务...")
             self.stop_event.set()
-            if self.current_process:
-                try:
-                    self.log_msg(f"强制终止 FFmpeg 进程 (PID: {self.current_process.pid})...")
-                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.current_process.pid)], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
-                except Exception as e:
-                    self.log_msg(f"停止失败: {e}")
+            
+            with self.active_processes_lock:
+                for proc in self.active_processes:
+                    try:
+                        self.log_msg(f"强制终止 FFmpeg 进程 (PID: {proc.pid})...")
+                        subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                    except Exception as e:
+                        self.log_msg(f"停止失败: {e}")
 
-    def process_queue(self):
+    def process_queue(self, settings):
         ffmpeg = self.get_ffmpeg_path()
-        total = len(self.file_list)
-        success_count = 0
+        self.total_files_count = len(self.file_list)
+        self.finished_files_count = 0
+        self.failed_files_count = 0
         
-        for i, file_path in enumerate(self.file_list):
-            if self.stop_event.is_set():
-                break
-                
-            fname = os.path.basename(file_path)
-            self.update_ui_text(f"🚀 正在处理 ({i+1}/{total}): {fname}", 0)
-            self.log_msg(f"=== 开始处理文件: {file_path} ===")
+        # 初始化每个文件的进度 (0.0 - 1.0)
+        self.file_progress_map = {f: 0.0 for f in self.file_list}
+        self.file_progress_lock = threading.Lock()
+        
+        max_workers = int(settings["threads"])
+        vol_debug = settings["volume"]
+        self.log_msg(f"启动配置: 线程={max_workers}, 音量={int(round(vol_debug*100))}%, 裁剪={settings['crop']}, 跳过={settings['skip_start']}s/{settings['skip_end']}s")
+
+        # 使用 ThreadPoolExecutor 进行并行处理
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self.run_ffmpeg_task, ffmpeg, f, settings): f for f in self.file_list}
             
-            success = self.run_ffmpeg_task(ffmpeg, file_path)
-            
-            if success:
-                success_count += 1
-                self.log_msg(f"=== 文件处理成功 ===")
-            else:
-                self.log_msg(f"=== 文件处理失败 ===")
+            for future in concurrent.futures.as_completed(futures):
                 if self.stop_event.is_set():
-                    self.update_ui_text("⚠️ 任务已终止", 0)
-                    break 
-        
+                    break
+                
+                # 这里的 result 是 run_ffmpeg_task 的返回值 (True/False)
+                # 但因为我们在 task 内部处理了异常和日志，这里主要是为了确保任务完成
+                pass
+
         self.is_processing = False
-        self.after(0, lambda: self.reset_ui(success_count, total))
+        self.after(0, lambda: self.reset_ui(self.finished_files_count, self.total_files_count))
+
+    def check_loudness(self, ffmpeg, file_path):
+        try:
+            self.log_msg(f"正在分析输出文件音量...")
+            cmd = [
+                ffmpeg, "-hide_banner",
+                "-i", file_path,
+                "-af", "volumedetect",
+                "-vn", "-sn", "-dn",
+                "-f", "null", "-"
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+            
+            # [Parsed_volumedetect_0 @ ...] mean_volume: -29.1 dB
+            import re
+            match = re.search(r"mean_volume:\s+([-\d.]+)\s+dB", res.stderr)
+            if match:
+                vol = float(match.group(1))
+                self.log_msg(f"🔍 验证: 输出文件平均音量为 {vol} dB")
+                if vol > -15.0: # 一般正常音量在 -10 到 -20 之间，如果压缩了90%应该远低于 -15
+                    self.log_msg("⚠️ 警告: 音量似乎仍然很大，请检查播放器是否开启了'音量规格化'或'响度平衡'功能。")
+            else:
+                self.log_msg("验证音量失败: 无法解析结果")
+        except Exception as e:
+            self.log_msg(f"验证音量出错: {e}")
 
     def detect_crop(self, ffmpeg, input_path, start_time=0):
         """
@@ -488,28 +549,29 @@ class App(ctk.CTk):
             self.log_msg(f"自动裁剪检测失败: {e}")
             return None
 
-    def run_ffmpeg_task(self, ffmpeg, input_path):
+    def run_ffmpeg_task(self, ffmpeg, input_path, settings):
         directory, filename = os.path.split(input_path)
         name, _ = os.path.splitext(filename)
         output_filename = f"{name}_800x450_compressed.mp4"
         
-        if self.output_dir and os.path.exists(self.output_dir):
-            output_path = os.path.join(self.output_dir, output_filename)
+        output_dir = settings["output_dir"]
+        if output_dir and os.path.exists(output_dir):
+            output_path = os.path.join(output_dir, output_filename)
         else:
             output_path = os.path.join(directory, output_filename)
         
         # 获取用户设置
         try:
-            skip_start = float(self.entry_skip_start.get())
+            skip_start = float(settings["skip_start"])
         except:
             skip_start = 0.0
             
         try:
-            skip_end = float(self.entry_skip_end.get())
+            skip_end = float(settings["skip_end"])
         except:
             skip_end = 0.0
             
-        do_crop = self.var_crop.get()
+        do_crop = settings["crop"]
 
         duration = 0
         try:
@@ -525,7 +587,7 @@ class App(ctk.CTk):
                 if match:
                     h, m, s = map(float, match.groups())
                     duration = h*3600 + m*60 + s
-                self.log_msg(f"视频总时长: {duration} 秒")
+                self.log_msg(f"[{filename}] 视频总时长: {duration} 秒")
         except Exception as e:
             self.log_msg(f"Probe Error: {e}")
 
@@ -539,7 +601,7 @@ class App(ctk.CTk):
              self.log_msg(f"⚠️ 设置的裁剪后时长无效 (总:{duration} - 头:{skip_start} - 尾:{skip_end} <= 0)。")
              return False
 
-        vol_factor = self.slider_vol.get()
+        vol_factor = settings["volume"]
         
         # 视频滤镜链构建
         filters = []
@@ -604,8 +666,20 @@ class App(ctk.CTk):
         if skip_end > 0:
              cmd.extend(["-t", str(actual_duration)])
              
+        # 构建音频滤镜
+        audio_filters = []
+        # volume 滤镜 (当不为 1.0 时或为了确保设置生效，我们总是应用，除非是 0需要特殊处理?)
+        # FFmpeg volume=0.0 Silence, volume=1.0 Normal.
+        audio_filters.append(f"volume={vol_factor:.2f}")
+
         cmd.extend([
-            "-vf", vf_chain,
+            "-vf", vf_chain
+        ])
+
+        if audio_filters:
+            cmd.extend(["-af", ",".join(audio_filters)])
+
+        cmd.extend([
             "-c:v", self.encoder_name,
 
             "-b:v", "800k",
@@ -613,7 +687,6 @@ class App(ctk.CTk):
             "-bufsize", "1600k",
             "-c:a", "aac",
             "-b:a", "128k",
-            "-af", f"volume={vol_factor:.2f}",
             output_path
         ])
         
@@ -622,12 +695,20 @@ class App(ctk.CTk):
         elif "libx264" in self.encoder_name:
             cmd.extend(["-preset", "medium"])
             
+        db_val = 0
+        if vol_factor > 0:
+            db_val = 20 * math.log10(vol_factor)
+        elif vol_factor == 0:
+            db_val = -999
+            
+        self.log_msg(f"[{name}] 音量设置: {vol_factor:.2f} ({(vol_factor*100):.0f}%) -> {db_val:.1f}dB")
         self.log_msg(f"执行命令: {' '.join(cmd)}")
         
         start_time = time.time()
         
+        proc = None
         try:
-            self.current_process = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
@@ -637,17 +718,20 @@ class App(ctk.CTk):
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
             )
             
+            with self.active_processes_lock:
+                self.active_processes.add(proc)
+            
             while True:
                 if self.stop_event.is_set():
-                    self.current_process.kill()
+                    proc.kill()
                     return False
                     
-                line = self.current_process.stdout.readline()
+                line = proc.stdout.readline()
                 if not line:
                     break
                 
                 if "Error" in line or "error" in line or "Invalid" in line:
-                    self.log_msg(f"[FFmpeg Error]: {line.strip()}")
+                    self.log_msg(f"[{os.path.basename(input_path)}] Error: {line.strip()}")
                 
                 if "time=" in line and duration > 0:
                     t_match = re.search(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})", line)
@@ -656,32 +740,48 @@ class App(ctk.CTk):
                         current_time = h*3600 + m*60 + s
                         percent = min(current_time / duration, 1.0)
                         
-                        elapsed = time.time() - start_time
-                        if percent > 0.001: # Avoid division by zero or super huge estimates
-                            eta = (elapsed / percent) - elapsed
-                        else:
-                            eta = 0
-                            
-                        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed))
-                        eta_str = time.strftime('%H:%M:%S', time.gmtime(eta))
+                        # 更新当前文件的进度
+                        with self.file_progress_lock:
+                            self.file_progress_map[input_path] = percent
                         
-                        fname_base = os.path.basename(input_path)
-                        status_text = f"⏳ {int(percent*100)}% | 已用: {elapsed_str} | 剩余: {eta_str} | {fname_base}"
-                        self.update_ui_text(status_text, percent)
+                        # 触发 UI 总进度更新
+                        self.after(0, self.update_composite_progress)
                 
-            self.current_process.wait()
-            ret_code = self.current_process.returncode
-            self.log_msg(f"FFmpeg 退出代码: {ret_code}")
+            proc.wait()
+            ret_code = proc.returncode
+            
+            if ret_code == 0:
+                with self.active_processes_lock:
+                    self.finished_files_count += 1
+                with self.file_progress_lock:
+                    self.file_progress_map[input_path] = 1.0
+                self.log_msg(f"✅ 文件成功: {os.path.basename(input_path)}")
+                
+                # 验证音量
+                if vol_factor < 0.99: # 只有在调整音量时才检查
+                    self.check_loudness(ffmpeg, output_path)
+            else:
+                with self.active_processes_lock:
+                    self.failed_files_count += 1
+                self.log_msg(f"❌ 文件失败: {os.path.basename(input_path)}")
+
+            # 更新总进度 UI
+            progress_val = (self.finished_files_count + self.failed_files_count) / self.total_files_count
+            status_text = f"处理中... 完成 {self.finished_files_count}/{self.total_files_count} (失败: {self.failed_files_count})"
+            self.update_ui_text(status_text, progress_val)
+                
             return ret_code == 0
             
         except Exception as e:
-            self.log_msg(f"执行异常: {e}")
-            import traceback
-            self.log_msg(traceback.format_exc())
+            self.log_msg(f"执行异常 [{os.path.basename(input_path)}]: {e}")
+            self.failed_files_count += 1
             return False
         finally:
-            self.current_process = None
-            # 清理临时字幕文件
+            if proc:
+                with self.active_processes_lock:
+                    if proc in self.active_processes:
+                        self.active_processes.remove(proc)
+             # 清理临时字幕文件
             if temp_sub_path and os.path.exists(temp_sub_path):
                 try:
                     os.remove(temp_sub_path)
@@ -689,10 +789,40 @@ class App(ctk.CTk):
                 except Exception as e:
                     self.log_msg(f"清理临时文件失败 (不影响结果): {e}")
 
+    def update_composite_progress(self):
+        """
+        计算所有文件的平均进度并更新 UI。
+        总进度 = (所有文件进度之和) / 文件总数
+        """
+        if not self.is_processing and self.finished_files_count + self.failed_files_count == self.total_files_count:
+            return # 避免结束后的多余刷新
+
+        with self.file_progress_lock:
+            total_sum = sum(self.file_progress_map.values())
+        
+        if self.total_files_count > 0:
+            avg_progress = total_sum / self.total_files_count
+        else:
+            avg_progress = 0
+            
+        progress_percent = int(avg_progress * 100)
+        
+        # 构建状态文本
+        if self.total_files_count == 1:
+            # 单文件模式：显示详细百分比
+            status_text = f"🚀 正在处理... {progress_percent}%"
+        else:
+            # 多文件模式：显示完成数量和总进度
+            status_text = f"🚀 并行处理中... 总进度 {progress_percent}% (完成 {self.finished_files_count}/{self.total_files_count})"
+            
+        self.progress_bar.set(avg_progress)
+        self.status_label.configure(text=status_text)
+
     def update_ui_text(self, text, progress):
         self.after(0, lambda: self._update_ui_progress(progress, text))
         
     def _update_ui_progress(self, val, text):
+        # 仅用于非计算进度的直接状态设置
         self.progress_bar.set(val)
         self.status_label.configure(text=text)
 
